@@ -1,0 +1,10 @@
+# dsh-workspace-alias bundle patch:
+# disable the official workspace row and mount the alias-aware subclass instead.
+# Everything that consumes ctx.workspaceRegistry (workspace-controller,
+# ui-workspace, sidebar) keeps working unchanged — we provide the same service.
+- id: workspace
+  disabled: true
+
+- insert:
+    - id: workspace-alias
+      name: 'dsh-workspace-alias'

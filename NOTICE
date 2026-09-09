@@ -1,0 +1,16 @@
+# NOTICE
+
+dsh-workspace-alias
+Copyright 2026 hwgzz (zzh)
+
+This plugin implements its own alias-resolution logic and subclasses the
+official DeepSeek Harness workspace registry:
+
+- DeepSeek Harness (https://github.com/deepseek-ai/deepseek-harness)
+  Copyright DeepSeek AI — MIT License.
+  The subclass in src/index.ts derives from
+  `@deepseek-ai/dsh-workspace`'s WorkspaceRegistry class.
+
+Implementation references (MIT/BSD, design-level only):
+- 6Mikao9/dsh-wsl-workspace (MIT) — plugin packaging pattern
+  (cordis.patch.yml insert row, dsh.compatibility manifest).

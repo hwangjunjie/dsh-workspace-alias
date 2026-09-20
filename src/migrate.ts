@@ -28,11 +28,15 @@
  * two spellings resolve to the same physical directory (case variants on
  * case-insensitive filesystems, mirroring the stock `sameFile` fallback).
  *
- * File format (verified on disk): `<dshHome>/sessions/<bucket>/<id>/
- * session.jsonl.zstd`, a zstd stream whose first frame holds the header
- * JSON line; later events are appended as additional frames. The rewrite
- * replaces frame 1 and keeps every subsequent frame byte-identical, so
- * dsh's append history is preserved untouched.
+ * File format: `<dshHome>/sessions/<bucket>/<id>/session[.vN].jsonl[.zstd]`,
+ * a zstd stream whose first frame holds the header JSON line; later events
+ * are appended as additional frames. Every scan resolves the NEWEST canonical
+ * generation (generation 0 = `session.jsonl`, N = `session.vN.jsonl`) — the
+ * one `resolveGenerationInDirectory` selects — because a stale generation-0
+ * stub left beside a v3 log must never be the file we rewrite: that would
+ * desync the authoritative log from its bucket instead of healing it. The
+ * rewrite replaces frame 1 and keeps every subsequent frame byte-identical,
+ * so dsh's append history is preserved untouched.
  * @module dsh-workspace-alias/migrate
  */
 
@@ -88,6 +92,58 @@ export function projectKey(cwd: string): string {
     }
   }
   return `--${(readable.replace(/^-+/, '') || 'root').slice(0, 251)}--`
+}
+
+/**
+ * Canonical generation basename -> version, or undefined when the name is not
+ * a canonical generation (temporary/foreign files). Ported from
+ * `dsh-session-format`: generation 0 is `session.jsonl`, generation N is
+ * `session.vN.jsonl`; the `.zstd` compression suffix is optional (plaintext).
+ */
+export function parseGenerationLogName(name: string): number | undefined {
+  const match = /^session(?:\.v(\d+))?\.jsonl(\.zstd)?$/.exec(name)
+  if (match === null) return undefined
+  return match[1] === undefined ? 0 : Number(match[1])
+}
+
+/** One stored session-log generation. */
+export interface GenerationLog {
+  name: string
+  file: string
+  version: number
+  compressed: boolean
+}
+
+/**
+ * Resolve the newest canonical generation inside one session directory — the
+ * file `dsh-session-persistence-jsonl`'s `resolveGenerationInDirectory`
+ * selects (highest version wins). Returns undefined for a directory storing
+ * none (not a session directory, or only temporary files).
+ */
+export async function newestGenerationLog(
+  dirPath: string,
+): Promise<GenerationLog | undefined> {
+  let entries
+  try {
+    entries = await readdir(dirPath, { withFileTypes: true })
+  } catch {
+    return undefined
+  }
+  let best: GenerationLog | undefined
+  for (const entry of entries) {
+    if (!entry.isFile()) continue
+    const version = parseGenerationLogName(entry.name)
+    if (version === undefined) continue
+    if (best === undefined || version > best.version) {
+      best = {
+        name: entry.name,
+        file: join(dirPath, entry.name),
+        version,
+        compressed: entry.name.endsWith('.zstd'),
+      }
+    }
+  }
+  return best
 }
 
 /** Size of the zstd magic number. */
@@ -182,13 +238,28 @@ export async function migrateSessionHeaders(opts: {
       continue
     }
     for (const id of ids) {
-      const file = join(bucketDir, id, 'session.jsonl.zstd')
+      // Newest canonical generation = the file the storage backend selects
+      // when it re-derives a session's location from (id, cwd). Generation 0
+      // (`session.jsonl.zstd`) is only a stale stub on a store that has since
+      // moved to `session.v3.jsonl.zstd`; rewriting that stub leaves the
+      // authoritative log mismatched with its bucket, which is the production
+      // "header id ... and cwd identify ..." failure this module exists to fix.
+      const generation = await newestGenerationLog(join(bucketDir, id))
+      if (generation === undefined) continue
+      const file = generation.file
       report.scanned++
       let buf: Buffer
       try {
         buf = await readFile(file)
       } catch {
-        report.scanned-- // no zstd payload in this dir — not a stored session
+        report.scanned-- // unreadable — not a usable stored session
+        continue
+      }
+      if (!generation.compressed) {
+        report.scanned--
+        report.errors.push(
+          `${id}: newest generation '${generation.name}' is not zstd-compressed`,
+        )
         continue
       }
       try {

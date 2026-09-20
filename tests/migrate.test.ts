@@ -63,7 +63,12 @@ describe('canonicalRewriteTarget', () => {
 })
 
 describe('migrateSessionHeaders', () => {
-  it('rewrites a foreign Windows cwd, relocates the dir, preserves later frames', async () => {
+  // POSIX-host cases: they rely on `F:\\notes` NOT being absolute, so the
+  // header rewrite triggers. On Windows win32 isAbsolute accepts Windows
+  // paths and nothing is rewritten, so these four are skipped there and
+  // still run on the macOS side (the machine that exercises cross-device
+  // rewriting).
+  it.skipIf(process.platform === 'win32')('rewrites a foreign Windows cwd, relocates the dir, preserves later frames', async () => {
     const { home, staleBucket, sessionsDir, config, localDir } = await makeEnv()
     const sessionDir = join(staleBucket, SID)
     await mkdir(sessionDir)
@@ -111,7 +116,7 @@ describe('migrateSessionHeaders', () => {
     expect(decompressAll(after)).toContain('"kept"')
   })
 
-  it('is idempotent — second run rewrites and moves nothing', async () => {
+  it.skipIf(process.platform === 'win32')('is idempotent — second run rewrites and moves nothing', async () => {
     const { home, staleBucket, sessionsDir, config, localDir } = await makeEnv()
     const sessionDir = join(staleBucket, SID)
     await mkdir(sessionDir)
@@ -143,7 +148,7 @@ describe('migrateSessionHeaders', () => {
     expect((await readFile(join(sessionDir, 'session.jsonl.zstd'))).equals(buf)).toBe(true)
   })
 
-  it('rewrites to the first POSIX member even when a later member exists locally', async () => {
+  it.skipIf(process.platform === 'win32')('rewrites to the first POSIX member even when a later member exists locally', async () => {
     const { home, staleBucket, sessionsDir, config, localDir } = await makeEnv()
     // Insert a non-existent first POSIX member ahead of the local one: the
     // rewrite target must be order-deterministic, not "what exists here".
@@ -164,7 +169,7 @@ describe('migrateSessionHeaders', () => {
     await expect(readFile(newPath)).resolves.toBeTruthy()
   })
 
-  it('reports unresolvable foreign cwd without touching the file', async () => {
+  it.skipIf(process.platform === 'win32')('reports unresolvable foreign cwd without touching the file', async () => {
     const { home, staleBucket, config } = await makeEnv()
     const sessionDir = join(staleBucket, SID)
     await mkdir(sessionDir)
@@ -187,6 +192,57 @@ describe('migrateSessionHeaders', () => {
     expect(report.rewritten).toHaveLength(0)
     expect(report.errors).toHaveLength(1)
     expect((await readFile(join(sessionDir, 'session.jsonl.zstd'))).equals(buf)).toBe(true)
+  })
+
+  it('uses the NEWEST generation, ignoring a stale generation-0 stub (production regression)', async () => {
+    // A store migrated to generation 3 keeps the old generation-0 stub beside
+    // the authoritative v3 log. Scanning only `session.jsonl.zstd` read the
+    // stub, so the directory was relocated (or left) by the STALE header while
+    // the v3 log kept a cwd its bucket no longer matched — the whole plugin
+    // tree then failed with "header id ... and cwd identify ...".
+    const { home, staleBucket, sessionsDir, config, realLocal } = await makeEnv()
+    const sessionDir = join(staleBucket, SID)
+    await mkdir(sessionDir)
+    const stub = zstdCompressSync(Buffer.from(headerJsonl('F:\\notes')))
+    const authoritative = writeMultiFrame(
+      headerJsonl(realLocal),
+      JSON.stringify({ type: 'user', text: 'kept' }) + '\n',
+    )
+    await writeFile(join(sessionDir, 'session.jsonl.zstd'), stub)
+    await writeFile(join(sessionDir, 'session.v3.jsonl.zstd'), authoritative)
+
+    const report = await migrateSessionHeaders({ dshHome: home, config })
+    expect(report.scanned).toBe(1)
+    expect(report.rewritten).toHaveLength(0)
+    expect(report.moved).toHaveLength(1)
+    const movedDir = join(sessionsDir, projectKey(realLocal), SID)
+    expect(decompressAll(await readFile(join(movedDir, 'session.v3.jsonl.zstd')))).toContain(
+      '"kept"',
+    )
+    // the stale stub travelled with the directory, byte-identical
+    expect((await readFile(join(movedDir, 'session.jsonl.zstd'))).equals(stub)).toBe(true)
+  })
+
+  it('ignores directories without any canonical generation', async () => {
+    const { home, staleBucket, config } = await makeEnv()
+    const sessionDir = join(staleBucket, SID)
+    await mkdir(sessionDir)
+    await writeFile(join(sessionDir, 'session.v3.jsonl.zstd.alias-tmp'), Buffer.from('junk'))
+    const report = await migrateSessionHeaders({ dshHome: home, config })
+    expect(report.scanned).toBe(0)
+    expect(report.moved).toHaveLength(0)
+    expect(report.errors).toHaveLength(0)
+  })
+
+  it('reports a newest plaintext generation instead of silently using a stale one', async () => {
+    const { home, staleBucket, config, realLocal } = await makeEnv()
+    const sessionDir = join(staleBucket, SID)
+    await mkdir(sessionDir)
+    await writeFile(join(sessionDir, 'session.jsonl'), headerJsonl(realLocal))
+    const report = await migrateSessionHeaders({ dshHome: home, config })
+    expect(report.scanned).toBe(0)
+    expect(report.moved).toHaveLength(0)
+    expect(report.errors).toHaveLength(1)
   })
 })
 

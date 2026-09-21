@@ -1,6 +1,6 @@
 {
   "name": "dsh-workspace-alias",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "DeepSeek Harness plugin: cross-device workspace path aliasing — let sessions synced from another machine (e.g. macOS /Volumes/Data/notes vs Windows F:\\notes) group into the local workspace of the same project.",
   "type": "module",
   "main": "lib/index.js",

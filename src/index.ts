@@ -114,8 +114,11 @@ async function aliasIndexHeader(this: any, header: SessionHeader): Promise<void>
  * Runs right after `recoverPendingMutation` (base init) so the first
  * `validateStoredState` sees a consistent table. Cheap when clean: one
  * table scan, zero writes.
+ *
+ * Exported for the regression test that pins the header-index input shape —
+ * see `tests/repair.test.ts`.
  */
-async function repairDuplicateClaims(self: any): Promise<void> {
+export async function repairDuplicateClaims(self: any): Promise<void> {
   const state = self.requireState?.() as { workspaceIds: string[] } | undefined
   const table = self.requireTable?.()
   if (!state || !table || table.size === 0) return
@@ -124,8 +127,27 @@ async function repairDuplicateClaims(self: any): Promise<void> {
   // arbiter. If sessionPersistence is unavailable, arbitration degrades to
   // registry order — still strictly better than refusing to start.
   try {
-    const headers = await self.ctx.sessionPersistence.list()
-    await self.replaceHeaderIndex(headers)
+    // `sessionPersistence.list()` yields `{ header, ... }` snapshots, not bare
+    // headers (cf. the stock `listStoredHeaders()`, which maps `.header`).
+    // Handing snapshots to `replaceHeaderIndex` drives every entry into the
+    // `header.cwd === undefined` branch, so the map it just cleared stays
+    // empty. `WorkspaceEntity.sessionIds` is a getter that filters the durable
+    // claims through that very map: the plugin tree stays healthy and nothing
+    // is logged, yet every Workspace renders empty and every Session drops into
+    // Ungrouped. This runs on every `enqueueOperation` — every registry write,
+    // plus any plugin's post-boot reconcile — so the blanking lands right after
+    // boot, before the renderer fetches its Workspace baseline. Map to the real
+    // header, and never re-index on an input that cannot repopulate the map.
+    const snapshots = await self.ctx.sessionPersistence.list()
+    const headers = snapshots.map((row: any) =>
+      row && row.header !== undefined ? row.header : row,
+    )
+    const usable = headers.some(
+      (header: any) => header && typeof header.cwd === 'string',
+    )
+    await self.replaceHeaderIndex(
+      usable ? headers : await self.listStoredHeaders(),
+    )
   } catch {
     // fall through
   }

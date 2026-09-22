@@ -124,6 +124,23 @@ export function wireAliasSettingsBridge(
       writeChain = writeChain.then(async () => {
         try {
           const shape = fromSettingsShape(next)
+          // An empty mirror is never an edit: it is a mirror that has not
+          // caught up (fresh install, namespace re-registered from schema
+          // defaults, a settings reset). Writing it over the JSON true source
+          // would empty the shared alias table for EVERY machine, because the
+          // file is the Syncthing-synced copy — observed on 2026-09-22, when
+          // one machine's empty mirror wiped the table for the other. So an
+          // empty table never wins over a populated one, and the mirror is
+          // repaired back to the file instead.
+          if (shape.groups.length === 0 && store.current.groups.length > 0) {
+            warn(
+              `refused to empty workspace-alias.json: the settings mirror has 0 group(s) while the file has ${store.current.groups.length} — edit the JSON file directly to clear the table on purpose`,
+            )
+            const truth = toSettingsShape(store.current)
+            lastMirror = canonicalShape(truth)
+            await settings.replace(ALIAS_SETTINGS_NAMESPACE, truth)
+            return
+          }
           await saveAliasConfig(aliasConfigPath(), shape)
           await store.reload()
           for (const message of store.drainDiagnostics()) warn(message)

@@ -107,4 +107,28 @@ describe('alias settings bridge', () => {
     // The settings path also reloads the table, which is what triggers the work.
     expect(calls).toBe(1)
   })
+
+  it('refuses to empty the shared table when the settings mirror is empty', async () => {
+    const groups = [
+      ['/Volumes/Data/notes', 'F:\\notes'],
+      ['/Volumes/Data/projects', 'F:\\projects'],
+    ]
+    const home = await tempHome({ version: 1, groups, autoAttach: true, adoptAliased: true })
+    const store = new AliasConfigStore()
+    await store.start()
+    const fake = fakeSettings()
+    wireAliasSettingsBridge(fakeCtx(fake.settings) as never, store)
+    // Let the initial mirror push land, then count from there.
+    await waitFor(() => fake.replaced.length >= 1)
+    const baseline = fake.replaced.length
+
+    // A mirror that has not caught up (fresh install, reset, schema defaults).
+    fake.fire({ groups: [], autoAttach: true })
+
+    // The push that follows is the repair, not an empty write.
+    await waitFor(() => fake.replaced.length > baseline)
+    expect(fake.replaced.at(-1)).toEqual({ groups, autoAttach: true, adoptAliased: true })
+    const saved = JSON.parse(readFileSync(join(home, 'workspace-alias.json'), 'utf8'))
+    expect(saved.groups).toEqual(groups)
+  })
 })

@@ -29,6 +29,18 @@ export interface AliasConfig {
    * local detach intent.
    */
   autoAttach?: boolean
+  /**
+   * When true, a session whose canonical cwd is a member of some alias group
+   * is attached to the workspace owning that path even when this boot did not
+   * resolve it through an alias fallback. This heals the backlog left by an
+   * earlier boot: migration rewrites a foreign header to a local path, and a
+   * session whose header now carries a locally-existing path can never again
+   * be recognized as "foreign", so backfill would otherwise skip it forever.
+   * Default false, because `detachSession` leaves no tombstone — an adoption
+   * pass cannot tell a deliberate detach from a never-attached session, so it
+   * would resurrect the former on every boot.
+   */
+  adoptAliased?: boolean
 }
 
 /** Normalize a path into a comparison key: separators unified, case-folded. */
@@ -67,7 +79,7 @@ export async function loadAliasConfig(
   try {
     raw = await readFile(file, 'utf8')
   } catch {
-    return { version: 1, groups: [], autoAttach: true }
+    return { version: 1, groups: [], autoAttach: true, adoptAliased: false }
   }
   let parsed: unknown
   try {
@@ -98,16 +110,18 @@ export async function loadAliasConfig(
     version: 1,
     groups,
     autoAttach: obj.autoAttach === undefined ? true : obj.autoAttach === true,
+    adoptAliased: obj.adoptAliased === true,
   }
 }
 
 /**
  * The shape exposed through the DSH settings service (the UI mirror layer).
  * Identical information to {@link AliasConfig} minus the `version` envelope:
- * the settings namespace stores only `{ autoAttach, groups }`.
+ * the settings namespace stores only `{ autoAttach, adoptAliased, groups }`.
  */
 export interface AliasSettingsShape {
   autoAttach: boolean
+  adoptAliased: boolean
   groups: string[][]
 }
 
@@ -115,6 +129,7 @@ export interface AliasSettingsShape {
 export function toSettingsShape(config: AliasConfig): AliasSettingsShape {
   return {
     autoAttach: config.autoAttach ?? true,
+    adoptAliased: config.adoptAliased ?? false,
     groups: config.groups.map((group) => [...group]),
   }
 }
@@ -130,6 +145,7 @@ export function canonicalShape(shape: unknown): string {
   const groups = Array.isArray(obj.groups) ? obj.groups : []
   return JSON.stringify({
     autoAttach: obj.autoAttach === undefined ? true : obj.autoAttach === true,
+    adoptAliased: obj.adoptAliased === true,
     groups: groups.map((group: unknown) =>
       Array.isArray(group) ? group.map((member) => String(member)) : [String(group)],
     ),
@@ -155,6 +171,7 @@ export function fromSettingsShape(shape: unknown): AliasSettingsShape {
   }
   return {
     autoAttach: obj.autoAttach === undefined ? true : obj.autoAttach === true,
+    adoptAliased: obj.adoptAliased === true,
     groups: obj.groups.map((group: unknown, index: number) => {
       if (!Array.isArray(group) || group.length < 1) {
         throw new Error(`settings value: group #${index} must be an array of >= 1 paths`)
@@ -173,7 +190,7 @@ export function fromSettingsShape(shape: unknown): AliasSettingsShape {
  */
 export async function saveAliasConfig(file: string, config: AliasSettingsShape): Promise<void> {
   const body = JSON.stringify(
-    { version: 1, groups: config.groups, autoAttach: config.autoAttach },
+    { version: 1, groups: config.groups, autoAttach: config.autoAttach, adoptAliased: config.adoptAliased },
     null,
     2,
   )
@@ -261,4 +278,54 @@ export function canonicalRewriteTarget(
     return null
   }
   return null
+}
+
+/**
+ * Whether `path` is declared as an alias-group member (separator/case
+ * normalized). The adoption pass uses this to recognize "this canonical cwd
+ * is one of the paths the user told us represent the same project across
+ * machines" — the durable half of foreign-ness that survives a header
+ * rewrite, since a rewritten cwd no longer fails realpath locally.
+ */
+export function isAliasMemberPath(
+  path: string,
+  config: Pick<AliasConfig, 'groups'>,
+): boolean {
+  const key = pathKey(path)
+  if (key.length === 0) return false
+  return config.groups.some((group) => group.some((member) => pathKey(member) === key))
+}
+
+/**
+ * Comparison keys for every declared alias member, literal AND resolved: the
+ * key of the path as the user wrote it plus, when the member exists on this
+ * machine, the key of its realpath.
+ *
+ * Both are needed because the two sides are normalized differently. Workspace
+ * records and indexed session paths hold already-resolved paths, while a
+ * declared member may sit behind a symlinked prefix (`/tmp` ->
+ * `/private/tmp`, a symlinked mount point) or, conversely, be the resolved
+ * form while the index holds the literal one. Comparing keys without
+ * realpathing the members would therefore miss exactly the sessions the
+ * adoption pass exists to recognize. Members that do not resolve locally
+ * contribute their literal key only.
+ */
+export async function aliasMemberKeys(
+  config: Pick<AliasConfig, 'groups'>,
+  realpath: (path: string) => Promise<string>,
+): Promise<Set<string>> {
+  const keys = new Set<string>()
+  for (const group of config.groups) {
+    for (const member of group) {
+      const literal = pathKey(member)
+      if (literal.length > 0) keys.add(literal)
+      try {
+        const resolved = pathKey(await realpath(member))
+        if (resolved.length > 0) keys.add(resolved)
+      } catch {
+        // Member absent on this machine: the literal key is all we have.
+      }
+    }
+  }
+  return keys
 }

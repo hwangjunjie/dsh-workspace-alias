@@ -48,6 +48,14 @@ export const AliasSettingsSchema = z.object({
     .boolean()
     .default(true)
     .description('启动时把经别名解析的跨机会话自动附加到本地 workspace'),
+  adoptAliased: z
+    .boolean()
+    .default(false)
+    .description(
+      '启动时把「cwd 命中别名组、但当前没有任何 workspace 归属」的存量会话附加到对应 workspace。' +
+        '用于修复历史遗留的未分组会话（早期版本已把 header 改写成本机路径的会话，无法再被识别为跨机来源）。' +
+        '注意：手动 detach 不留墓碑，开启后别名项目里被刻意移出的会话会在下次启动被重新挂上。',
+    ),
   groups: z
     .array(z.array(z.string()))
     .description(
@@ -59,8 +67,17 @@ export const AliasSettingsSchema = z.object({
 /**
  * Wire the JSON <-> settings mirror. Called from `Service.init`; when the
  * settings service is absent this resolves to a no-op.
+ *
+ * `afterChange` runs whenever the in-memory table really changed — a settings
+ * edit or an external (synced / hand-edited) JSON edit. The owner uses it to
+ * re-run work that depends on the table, so that switching a flag on (for
+ * example `adoptAliased`) takes effect without an app restart.
  */
-export function wireAliasSettingsBridge(ctx: Context, store: AliasConfigStore): void {
+export function wireAliasSettingsBridge(
+  ctx: Context,
+  store: AliasConfigStore,
+  afterChange?: () => void,
+): void {
   const inject = (ctx as any).inject?.bind(ctx)
   if (typeof inject !== 'function') return
   inject(['settings'], (settingsCtx: any) => {
@@ -122,13 +139,21 @@ export function wireAliasSettingsBridge(ctx: Context, store: AliasConfigStore): 
     store.onChange = (): void => {
       const shape = toSettingsShape(store.current)
       const canonicalNow = canonicalShape(shape)
-      if (canonicalNow === lastMirror) return
-      lastMirror = canonicalNow
-      void Promise.resolve()
-        .then(() => settings.replace(ALIAS_SETTINGS_NAMESPACE, shape))
-        .catch((error: unknown) => {
-          warn(`settings mirror update failed: ${String(error)}`)
-        })
+      if (canonicalNow !== lastMirror) {
+        lastMirror = canonicalNow
+        void Promise.resolve()
+          .then(() => settings.replace(ALIAS_SETTINGS_NAMESPACE, shape))
+          .catch((error: unknown) => {
+            warn(`settings mirror update failed: ${String(error)}`)
+          })
+      }
+      // The table behind this change may have flipped a behavior flag, so tell
+      // the owner after the mirror write is queued.
+      try {
+        afterChange?.()
+      } catch (error: unknown) {
+        warn(`config-change hook failed: ${String(error)}`)
+      }
     }
   })
 }

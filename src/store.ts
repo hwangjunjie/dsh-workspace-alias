@@ -10,7 +10,7 @@ import { aliasConfigPath, loadAliasConfig } from './alias.ts'
 import type { AliasConfig } from './alias.ts'
 
 export class AliasConfigStore {
-  private config: AliasConfig = { version: 1, groups: [], autoAttach: true }
+  private config: AliasConfig = { version: 1, groups: [], autoAttach: true, adoptAliased: false }
   /** Canonical snapshot of {@link config}; detects real changes on reload. */
   private snapshot = JSON.stringify(this.config)
   private started = false

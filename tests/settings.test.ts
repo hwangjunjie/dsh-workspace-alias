@@ -90,6 +90,8 @@ describe('alias settings bridge', () => {
       },
     )
 
+    // A UI edit can only happen once the app is up, i.e. after the boot push.
+    await waitFor(() => fake.replaced.length >= 1)
     fake.fire({ groups: [['/a', 'b']], autoAttach: true, adoptAliased: true })
 
     const file = join(home, 'workspace-alias.json')
@@ -129,6 +131,26 @@ describe('alias settings bridge', () => {
     await waitFor(() => fake.replaced.length > baseline)
     expect(fake.replaced.at(-1)).toEqual({ groups, autoAttach: true, adoptAliased: true })
     const saved = JSON.parse(readFileSync(join(home, 'workspace-alias.json'), 'utf8'))
+    expect(saved.groups).toEqual(groups)
+  })
+
+  it('does not let a stale mirror value overwrite the file at boot', async () => {
+    const groups = [['/Volumes/Data/notes', 'F:\\notes']]
+    const home = await tempHome({ version: 1, groups, autoAttach: true, adoptAliased: true })
+    const store = new AliasConfigStore()
+    await store.start()
+    const fake = fakeSettings()
+    wireAliasSettingsBridge(fakeCtx(fake.settings) as never, store)
+
+    // A mirror left by a previous (older) build: same groups, but it never
+    // knew about adoptAliased, so the schema resolves that field to `false`.
+    // Fired before the initial push lands, it is not a user edit.
+    fake.fire({ groups, autoAttach: true })
+
+    await waitFor(() => fake.replaced.length >= 1)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const saved = JSON.parse(readFileSync(join(home, 'workspace-alias.json'), 'utf8'))
+    expect(saved.adoptAliased).toBe(true)
     expect(saved.groups).toEqual(groups)
   })
 })

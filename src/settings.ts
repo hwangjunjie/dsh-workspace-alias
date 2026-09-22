@@ -99,6 +99,14 @@ export function wireAliasSettingsBridge(
     // so the opposite direction recognizes its own echo and stops.
     let lastMirror = canonicalShape(toSettingsShape(store.current))
     let writeChain: Promise<void> = Promise.resolve()
+    // The mirror is only trusted once our own push has landed. A namespace
+    // that has just been registered can report a value built from schema
+    // defaults, or the value a previous run of an older build left behind —
+    // neither is a user edit, and treating it as one silently overwrites the
+    // true source (observed risk: a mirror that never knew `adoptAliased`
+    // pushing `false` over the file's `true`, quietly cancelling the one-shot
+    // backlog adoption).
+    let pushed = false
 
     const warn = (message: string): void => {
       logger?.warn?.(`[dsh-workspace-alias] ${message}`)
@@ -110,7 +118,13 @@ export function wireAliasSettingsBridge(
       .then(() =>
         settings.replace(ALIAS_SETTINGS_NAMESPACE, toSettingsShape(store.current)),
       )
+      .then(() => {
+        pushed = true
+      })
       .catch((error: unknown) => {
+        // Keep the bridge functional: the empty-table guard below still
+        // protects the bulk of the table if the mirror is left on defaults.
+        pushed = true
         warn(`initial settings mirror failed (UI shows defaults until next sync): ${String(error)}`)
       })
 
@@ -120,6 +134,10 @@ export function wireAliasSettingsBridge(
     scope.watch?.((next: unknown) => {
       const canonicalNext = canonicalShape(next)
       if (canonicalNext === lastMirror) return
+      // Before the initial push lands there is no evidence that `next` is a
+      // user edit rather than the mirror's stale/default value, so it is only
+      // remembered as the current mirror content, never written to the file.
+      if (!pushed) return
       lastMirror = canonicalNext
       writeChain = writeChain.then(async () => {
         try {

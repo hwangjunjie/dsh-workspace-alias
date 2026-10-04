@@ -17,6 +17,14 @@
  *   did not originate from the other side. Writes on both sides are
  *   idempotent, so even a race converges instead of oscillating.
  *
+ * Two host generations are supported, because the settings surface changed in
+ * DSH 0.2.0-rc: the namespace-scoped `settings.register()` service was removed
+ * and settings pages are now served from the loader entry's own `.volatile()`
+ * config (written through `configEditor.edit`). `wireAliasConfigBridge()`
+ * drives that surface; `wireAliasSettingsBridge()` drives the old one. Both
+ * implement the same JSON-as-true-source mirror, and the one whose surface is
+ * absent is a no-op.
+ *
  * The whole bridge is optional: when the settings service is not mounted
  * (host without `dsh-settings`), `ctx.inject(['settings'], ...)` never
  * fires and the plugin keeps working exactly as before (JSON file +
@@ -32,6 +40,7 @@ import {
   fromSettingsShape,
   saveAliasConfig,
   toSettingsShape,
+  type AliasSettingsShape,
 } from './alias.ts'
 import type { AliasConfigStore } from './store.ts'
 
@@ -63,6 +72,191 @@ export const AliasSettingsSchema = z.object({
         '本机不存在的成员用于解析从其他机器同步来的会话。',
     ),
 })
+
+/**
+ * Whether the schemastery the host provides understands `.volatile()`. The
+ * marker (and the whole config-backed settings surface) arrived with DSH
+ * 0.2.0-rc, so this doubles as "is this host's settings page fed from plugin
+ * config". Probed instead of hardcoded: the plugin resolves schemastery from
+ * the host, and an older host must keep the namespace-scoped bridge.
+ */
+const VOLATILE_MARKER = (z.boolean() as unknown as { volatile?: unknown }).volatile
+export const HOST_SETTINGS_ARE_CONFIG_BACKED = typeof VOLATILE_MARKER === 'function'
+
+/** Apply the `.volatile()` marker when the host's schemastery supports it. */
+function volatileField<T>(schema: T): T {
+  if (!HOST_SETTINGS_ARE_CONFIG_BACKED) return schema
+  return (schema as unknown as { volatile(): T }).volatile()
+}
+
+/**
+ * Schema of the plugin entry's own config on DSH >= 0.2.0-rc, where settings
+ * pages are served by the host from the loader entry (see
+ * {@link wireAliasConfigBridge}). Every field is `.volatile()`: editing one
+ * commits the new value into the running plugin instead of remounting it,
+ * which is what keeps `workspace-alias.json` writes idempotent while the
+ * settings page stays open.
+ */
+export const AliasSettingsConfig = z.object({
+  autoAttach: volatileField(z.boolean().default(true)).description(
+    '启动时把经别名解析的跨机会话自动附加到本地 workspace',
+  ),
+  adoptAliased: volatileField(z.boolean().default(false)).description(
+    '启动时把 cwd 命中别名组的存量会话附加到对应 workspace',
+  ),
+  groups: volatileField(z.array(z.array(z.string())).default([])).description(
+    '别名组：组内路径指向不同机器上的同一个项目目录',
+  ),
+})
+
+/** Per-field config references the loader hands to the plugin constructor. */
+export interface AliasSettingsRefs {
+  autoAttach?: { get(): unknown }
+  adoptAliased?: { get(): unknown }
+  groups?: { get(): string[][] | undefined }
+}
+
+/**
+ * Wire the JSON <-> settings mirror for hosts whose settings pages are built
+ * from the plugin entry's own config (DSH >= 0.2.0-rc: `settings.register` was
+ * removed, pages are served by `@deepseek-ai/dsh-settings` from the loader
+ * entry's `.volatile()` fields, and edits are persisted through
+ * `configEditor.edit`).
+ *
+ * `refs` are the per-field config references the loader hands to the plugin
+ * constructor (see `AliasSettingsConfig`); they are the live view of the
+ * profile-side settings document. When the host has no such surface (fields
+ * are not references, no config editor) this is a no-op and the older
+ * namespace bridge — or hand-edited JSON — stays in charge.
+ *
+ * Same two-way contract as {@link wireAliasSettingsBridge}: JSON is the true
+ * source, the settings document is the mirror, and `canonicalShape()` string
+ * comparison against `lastMirror` stops each direction from echoing the other.
+ */
+export function wireAliasConfigBridge(
+  ctx: Context,
+  store: AliasConfigStore,
+  refs: AliasSettingsRefs | undefined,
+  afterChange?: () => void,
+): void {
+  const anyCtx = ctx as any
+  const groupsRef = refs?.groups
+  if (typeof groupsRef?.get !== 'function') return
+
+  const logger = anyCtx.logger
+  const warn = (message: string): void => {
+    logger?.warn?.(`[dsh-workspace-alias] ${message}`)
+  }
+
+  let lastMirror = canonicalShape(toSettingsShape(store.current))
+  let writeChain: Promise<void> = Promise.resolve()
+  // Mirror writes are only trusted once our own push landed: an entry whose
+  // config still holds schema defaults must never overwrite the shared table
+  // (the JSON file is the Syncthing-synced copy for every machine).
+  let pushed = false
+
+  /** Write the mirror value into the profile settings document. */
+  const pushToConfig = async (shape: { autoAttach: boolean; adoptAliased: boolean; groups: string[][] }): Promise<void> => {
+    const editor = typeof anyCtx.get === 'function' ? anyCtx.get('configEditor') : undefined
+    const entry = anyCtx.fiber?.entry
+    if (typeof editor?.edit !== 'function' || entry === undefined) {
+      throw new Error('host exposes no configEditor for the settings document')
+    }
+    await editor.edit(entry, () => ({
+      autoAttach: shape.autoAttach === true,
+      adoptAliased: shape.adoptAliased === true,
+      groups: shape.groups.map((group) => [...group]),
+    }))
+  }
+
+  const autoRef = refs?.autoAttach
+  const adoptRef = refs?.adoptAliased
+
+  const readBool = (ref: { get(): unknown } | undefined, fallback: boolean): boolean => {
+    const value = ref?.get?.()
+    return value === undefined ? fallback : value === true
+  }
+
+  const readConfigShape = (): AliasSettingsShape => ({
+    autoAttach: readBool(autoRef, true),
+    adoptAliased: readBool(adoptRef, false),
+    groups: (groupsRef.get() ?? []).map((group) => [...group]),
+  })
+
+  // Settings edit -> JSON true source. Subscribed BEFORE the initial push so
+  // no genuine edit can fall between the two.
+  if (typeof anyCtx.on === 'function') {
+    anyCtx.on('loader/volatile-update', () => {
+      const next = readConfigShape()
+      const canonicalNext = canonicalShape(next)
+      // Echo of our own push, or the pre-push defaults: nothing to persist.
+      if (canonicalNext === lastMirror || !pushed) return
+      lastMirror = canonicalNext
+      writeChain = writeChain.then(async () => {
+        try {
+          const shape = fromSettingsShape(next)
+          // An empty table is never an edit: it means the settings document
+          // has not caught up (fresh profile, reset). Writing it over the JSON
+          // true source would empty the alias table for EVERY machine, so the
+          // document is repaired from the file instead.
+          if (shape.groups.length === 0 && store.current.groups.length > 0) {
+            warn(
+              `refused to empty workspace-alias.json: the settings document has 0 group(s) while the file has ${store.current.groups.length} — edit the JSON file directly to clear the table on purpose`,
+            )
+            const truth = toSettingsShape(store.current)
+            lastMirror = canonicalShape(truth)
+            await pushToConfig(truth).catch((error: unknown) => {
+              warn(`settings document repair failed: ${String(error)}`)
+            })
+            return
+          }
+          await saveAliasConfig(aliasConfigPath(), shape)
+          await store.reload()
+          for (const message of store.drainDiagnostics()) warn(message)
+        } catch (error) {
+          // Never write invalid data over the shared table; the document keeps
+          // the edited value while the file stays at its last good state.
+          warn(`settings edit NOT written to workspace-alias.json: ${String(error)}`)
+        }
+      })
+    })
+  }
+
+  // Initial push: the settings document starts as an exact copy of the true
+  // source, overwriting stale defaults or a layer left by an older run.
+  void Promise.resolve()
+    .then(() => pushToConfig(toSettingsShape(store.current)))
+    .then(() => {
+      pushed = true
+    })
+    .catch((error: unknown) => {
+      // Stay functional (the empty-table guard still protects the bulk of the
+      // table); a later edit is what would otherwise be silently dropped.
+      pushed = true
+      warn(`initial settings document write failed (settings UI shows stale values): ${String(error)}`)
+    })
+
+  // JSON change (other machine via sync, or hand edit) -> settings document.
+  store.onChange = (): void => {
+    const shape = toSettingsShape(store.current)
+    const canonicalNow = canonicalShape(shape)
+    if (canonicalNow !== lastMirror) {
+      lastMirror = canonicalNow
+      void Promise.resolve()
+        .then(() => pushToConfig(shape))
+        .catch((error: unknown) => {
+          warn(`settings document update failed: ${String(error)}`)
+        })
+    }
+    // The table may have flipped a behavior flag, so tell the owner after the
+    // mirror write is queued.
+    try {
+      afterChange?.()
+    } catch (error: unknown) {
+      warn(`config-change hook failed: ${String(error)}`)
+    }
+  }
+}
 
 /**
  * Wire the JSON <-> settings mirror. Called from `Service.init`; when the

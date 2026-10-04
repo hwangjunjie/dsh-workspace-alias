@@ -11,18 +11,28 @@
  *
  * Purity rules (runtime-enforced, mirrors the build-time bundle purity gate):
  * - The only value imports allowed here are seed modules ("react").
- * - Everything DSH-related is reached through cordis services on ctx:
- *     slots         -> register the "settings.section" slot
- *     settingsScope -> bind({ namespace }) read/write face for our namespace
- *   Writes ride the settingsScope's owned write path (revision-fenced);
- *   we never import @deepseek-ai/* client packages as values.
+ * - Everything DSH-related is reached through cordis services on ctx. Two
+ *   settings generations exist and the newer one removed the old service, so
+ *   this half MUST NOT name a possibly-absent service in `exports.inject`
+ *   (a static inject of a missing service fails the whole client boot — seen
+ *   on DSH desktop 2.0.15 as `RendererStartupFailure: Renderer boot failed
+ *   for 1 plugin(s)`). It probes with runtime injection instead:
+ *     slots -> register the "settings.section" slot (both generations)
+ *     ctx.inject(["configForms"])   -> DSH >= 0.2.0-rc: pages come from the
+ *                                      plugin entry's own `.volatile()` config
+ *                                      fields, served by the Host and mirrored
+ *                                      to this process by `ctx.configForms`.
+ *     ctx.inject(["settingsScope"]) -> older DSH: namespace-scoped settings
+ *                                      service (`bind({ namespace })`).
+ *   Writes ride the owning service's revision-fenced write path; we never
+ *   import @deepseek-ai/* client packages as values.
  *
  * UI model: the section is a draft editor. The host stays the fact source —
  * a draft is created on the first local edit and "保存更改" commits both
  * fields through one atomic mutate; 放弃 re-syncs from the host snapshot.
  * The JSON file (workspace-alias.json) remains the single true source; the
  * host-side settings bridge (src/settings.ts) mirrors writes into it and
- * pushes external file changes back into this namespace.
+ * pushes external file changes back into the host-side settings surface.
  */
 
 window.__ModuleLoader__.load({
@@ -298,22 +308,84 @@ window.__ModuleLoader__.load({
               ? el("span", { style: STYLES.muted }, "（当前连接为只读）") : null));
     }
 
+    // ---- settings-surface adapters -------------------------------------------
+
+    /**
+     * Adapt the DSH >= 0.2.0-rc surface (`ctx.configForms`) to the controller
+     * face this component was written against — `{ subscribe, getSnapshot,
+     * mutate }` with snapshots of `{ status, value, revision, writable }`.
+     *
+     * The Host form's snapshot already carries every field, so the only work
+     * here is status normalization: a namespace that exists but whose value is
+     * not a plain object (never written, or still decoding) must report
+     * "loading"/"unavailable" instead of handing the renderer a value whose
+     * `.groups` is undefined. `mutate(ops)` stays the write entry point — the
+     * host fences it with the revision it currently holds.
+     */
+    function adaptConfigForm(form) {
+      return {
+        subscribe: function (listener) { return form.subscribe(listener); },
+        getSnapshot: function () {
+          var snap = form.getSnapshot() || {};
+          var value = snap.value;
+          var usable =
+            snap.status === "ready" &&
+            value !== null &&
+            typeof value === "object" &&
+            !Array.isArray(value);
+          return {
+            status: usable ? "ready" : (snap.status === "loading" ? "loading" : "unavailable"),
+            value: usable ? value : undefined,
+            revision: snap.revision,
+            writable: snap.writable !== false,
+          };
+        },
+        mutate: function (ops, revision) { return form.mutate(ops, revision); },
+      };
+    }
+
     // ---- plugin body ---------------------------------------------------------
 
     function apply(ctx) {
-      var scope = ctx.settingsScope.bind({ namespace: NAMESPACE });
-      ctx.slots.inject("settings.section", function () {
-        return ctx.slots.register({
-          name: "settings.section",
-          id: "workspace-alias",
-          order: 60,
-          label: "工作区别名",
-        }, makeSectionComponent(scope));
+      /** Register the settings nav row + pane for a bound controller face. */
+      function registerSection(controller) {
+        return ctx.slots.inject("settings.section", function () {
+          return ctx.slots.register({
+            name: "settings.section",
+            id: "workspace-alias",
+            order: 60,
+            label: "工作区别名",
+          }, makeSectionComponent(controller));
+        });
+      }
+
+      // New generation (DSH >= 0.2.0-rc): the client has no settings service.
+      // Our page is backed by the plugin entry's own `.volatile()` config, so
+      // `whileServed` keeps the nav row in lockstep with the Host: it is
+      // registered once the Host serves this namespace and dropped when the
+      // entry stops being served. Effects own the disposers so the row cannot
+      // survive a lost namespace (nor linger after a client reload).
+      ctx.inject(["configForms"], function (scoped) {
+        return scoped.effect(function () {
+          return scoped.configForms.whileServed([NAMESPACE], function () {
+            return registerSection(adaptConfigForm(scoped.configForms.get(NAMESPACE)));
+          });
+        });
+      });
+
+      // Older generation: the namespace-scoped settings service.
+      ctx.inject(["settingsScope"], function (scoped) {
+        return scoped.effect(function () {
+          return registerSection(scoped.settingsScope.bind({ namespace: NAMESPACE }));
+        });
       });
     }
 
     exports.apply = apply;
-    exports.inject = ["slots", "settingsScope"];
+    // Only services that exist on EVERY supported runtime may be listed here;
+    // both settings surfaces are probed at runtime inside `apply` instead.
+    exports.inject = ["slots"];
+    exports.__test = { adaptConfigForm: adaptConfigForm };
     return module.exports;
   },
 });

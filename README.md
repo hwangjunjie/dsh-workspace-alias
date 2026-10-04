@@ -24,6 +24,13 @@ Session format v4 (DSH 0.2.0-rc.1 / rc.2) is verified compatible: the
 stored-header line structure is unchanged (only `version: 3 → 4`) and
 generation files `session.vN.jsonl[.zstd]` are recognized for any N.
 
+Settings page (v0.4.4): 0.2.0-rc replaced the client's `settingsScope` service
+and the host's `settings.register` with `ctx.configForms` plus a **volatile**
+entry config. The plugin probes both generations at runtime (and only claims
+the old client service when it actually exists — a static `settingsScope`
+inject would abort the whole client boot on rc.2), so one build runs on both
+0.1.x and 0.2.0-rc.x.
+
 Configure `<dshHome>/workspace-alias.json`:
 
 ```json
@@ -64,7 +71,12 @@ Session 格式 v4（DSH 0.2.0-rc.1 / rc.2）已验证兼容：存储头行结构
 
 两种方式，任选其一，结果等价（`workspace-alias.json` 始终是唯一真源）：
 
-**方式一：DSH 设置界面（推荐，v0.4.0 起）**。双半区插件：host 侧向 settings 服务注册 `workspace-alias` namespace；client 侧（`lib/client.js`，DSH client-module 格式）注册 `settings.section` slot，设置页出现「工作区别名」完整编辑区（别名组增删改 + `autoAttach` 开关，草稿式编辑、原子保存），保存即写回 JSON 文件、热生效。宿主无 settings 服务时自动退化为方式二，无需任何配置。
+**方式一：DSH 设置界面（推荐，v0.4.0 起）**。双半区插件：client 侧（`lib/client.js`，DSH client-module 格式）注册 `settings.section` slot，设置页出现「工作区别名」完整编辑区（别名组增删改 + `autoAttach` 开关，草稿式编辑、原子保存），保存即写回 JSON 文件、热生效。主机侧桥按宿主 settings API 的代际自动选择（v0.4.4 起）：
+
+- **DSH ≥ 0.2.0-rc**：宿主设置页由 loader entry 的 **volatile config** 驱动。插件声明 `static Config`（三个字段均 `.volatile()`），client 侧用 `ctx.configForms.whileServed(['workspace-alias'], …)` 拿到表单控制器，编辑经 `configEditor` 提交——volatile 字段意味着改配置**不会重挂插件**，只把新值提交进运行中的引用。
+- **DSH < 0.2.0-rc（0.1.x）**：沿用 namespace 化 `settings` 服务（`settings.register`）旧桥。
+
+两条路径都以「先探测宿主能力、面不存在就提前返回」实现，任一代际上只有一个桥持有文件写入权；宿主既无 `configForms` 也无 `settingsScope` 时自动退化为方式二，无需任何配置。
 
 **方式二：手工编辑** `<dshHome>/workspace-alias.json`（建议纳入你的 `.dsh` 同步白名单，一台维护、两端生效）：
 
@@ -96,9 +108,19 @@ Session 格式 v4（DSH 0.2.0-rc.1 / rc.2）已验证兼容：存储头行结构
 
 ## 已知限制
 
-- 需要 `@deepseek-ai/dsh-workspace` 的内部形态稳定（rc 期破坏性变更风险，已在 `dsh.compatibility` 声明 0.1.x）
+- 需要 `@deepseek-ai/dsh-workspace` 的内部形态稳定（rc 期破坏性变更风险，已在 `dsh.compatibility` 声明 0.1.1-rc.1 ~ 0.2.0-rc.2）
 - 只做「历史会话归组」；同步进行中的会话（dsh 运行时 Syncthing 写入）在下次重启时归组
 - Windows 路径比较统一 `/` 分隔 + 大小写折叠（对 NTFS 不区分大小写的语义是正确的；对 macOS 大小写敏感盘的极端别名可能过宽）
+
+## 版本与宿主兼容
+
+| 插件版本 | 宿主 | 变更 |
+| --- | --- | --- |
+| 0.4.4 | 0.2.0-rc.2 | 适配宿主 settings API 换代：客户端**移除静态 `settingsScope` 注入**（rc.2 已无该服务，静态注入会让整个 client boot 失败：`RendererStartupFailure: Renderer boot failed for 1 plugin(s)`），改为运行时能力探测 `configForms` / `settingsScope` 双分支；主机侧新增 volatile config 桥（`static Config` + `configEditor`），旧 namespace 桥保留并加 `settings.configure({ auto: false })`（本插件自带页面，避免宿主重复渲染 schema 页） |
+| 0.4.3 | 0.2.0-rc.1 | 仓库迁移到 github.com/hwangjunjie；声明 0.2.0-rc.1 兼容；README 改为官方安装方式 |
+| 0.4.0 | 0.1.2-rc.1 | 设置界面（namespace 桥 + `settings.section` slot） |
+
+> 0.4.4 的另一半原因是：`@deepseek-ai/schemastery` 的 `.volatile()` 在宿主内置版本（3.18.4）存在、在插件 devDependency（3.18.2）不存在，因此 schema 用 `volatileField()` 运行时探测包装，而不是构建期写死——插件在两类宿主上都能加载。
 
 ## License
 

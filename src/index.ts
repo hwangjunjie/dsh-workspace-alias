@@ -33,10 +33,11 @@
  *     contradicting claims defensively before attaching.
  *
  * Config: `<dshHome>/workspace-alias.json` (see alias.ts) — editable either
- * by hand or through the DSH settings page (settings.ts mirrors the file
- * into a `workspace-alias` settings namespace; the file stays the synced
- * true source). Put the file in your file-sync scope so every machine
- * shares one table.
+ * by hand or through the DSH settings page. settings.ts mirrors the file into
+ * whichever settings surface the host has (the entry's own volatile config on
+ * DSH >= 0.2.0-rc, the `workspace-alias` settings namespace before that); the
+ * file stays the synced true source. Put the file in your file-sync scope so
+ * every machine shares one table.
  * @module dsh-workspace-alias
  */
 
@@ -57,7 +58,13 @@ import {
 } from './alias.ts'
 import { migrateSessionHeaders } from './migrate.ts'
 import { AliasConfigStore } from './store.ts'
-import { wireAliasSettingsBridge } from './settings.ts'
+import {
+  AliasSettingsConfig,
+  HOST_SETTINGS_ARE_CONFIG_BACKED,
+  wireAliasConfigBridge,
+  wireAliasSettingsBridge,
+  type AliasSettingsRefs,
+} from './settings.ts'
 
 const store = new AliasConfigStore()
 
@@ -244,12 +251,23 @@ async function recoverPendingMutationWithRepair(this: any): Promise<void> {
 export class AliasWorkspaceRegistry extends WorkspaceRegistry {
   static override inject = ['storageDomain', 'sessionPersistence']
 
+  /**
+   * Settings document of this entry on DSH >= 0.2.0-rc. Declaring it is what
+   * makes the host serve the `workspace-alias` namespace at all: pages are
+   * built from `.volatile()` config fields (see src/settings.ts).
+   */
+  static Config = AliasSettingsConfig
+
   /** True once the stock registry state exists (set at the end of init). */
   private ready = false
 
-  constructor(ctx: Context) {
+  /** Live per-field config references handed in by the loader (or absent). */
+  private readonly settingsRefs: AliasSettingsRefs | undefined
+
+  constructor(ctx: Context, config?: AliasSettingsRefs) {
     // WorkspaceRegistry hardcodes the service name internally; pass ctx only.
     super(ctx)
+    this.settingsRefs = config
   }
 
   protected override async [Service.init](): Promise<void> {
@@ -257,16 +275,40 @@ export class AliasWorkspaceRegistry extends WorkspaceRegistry {
     for (const message of store.drainDiagnostics()) {
       this.ctx.logger?.warn?.(`[dsh-workspace-alias] ${message}`)
     }
-    // Settings-UI bridge (no-op when the host has no settings service):
-    // the JSON file stays the synced true source, the settings namespace
-    // mirrors it for in-app editing.
+    // Settings-UI bridge (no-op when the host has no settings surface): the
+    // JSON file stays the synced true source, the settings document mirrors it
+    // for in-app editing.
     //
     // Either route a later config edit can take — the JSON file watcher or the
-    // settings namespace — ends in `store.onChange`, so both install the same
+    // settings surface — ends in `store.onChange`, so both install the same
     // reaction: turning `adoptAliased` on (settings UI, hand edit, or a synced
     // file) must adopt the backlog right away instead of on the next boot.
+    //
+    // Exactly one of the two bridges owns `store.onChange` on any given host:
+    // each returns before touching the store when its surface is absent (the
+    // old one when `settings.register` is missing — 0.2.0-rc and later; the new
+    // one when the loader hands no volatile config references).
     store.onChange = () => this.onAliasConfigChanged()
+    // Old surface: namespace-scoped settings service (DSH < 0.2.0-rc).
     wireAliasSettingsBridge(this.ctx, store, () => this.onAliasConfigChanged())
+    // New surface: the entry's own volatile config (DSH >= 0.2.0-rc). Gated on
+    // the host actually understanding `.volatile()`: without it the entry
+    // config is never served to a settings page, and a push would only remount
+    // this service through the normal config path.
+    if (HOST_SETTINGS_ARE_CONFIG_BACKED) {
+      wireAliasConfigBridge(this.ctx, store, this.settingsRefs, () => this.onAliasConfigChanged())
+    }
+    // This plugin ships its own settings page (the client half), so the host
+    // must not also render the schema-derived page for the same namespace.
+    this.ctx.inject(['settings'], (child: any) => {
+      try {
+        child.effect(() => child.settings.configure({ auto: false }, this.ctx.fiber))
+      } catch (error) {
+        this.ctx.logger?.warn?.(
+          `[dsh-workspace-alias] settings presentation not configured (host may render its own page): ${String(error)}`,
+        )
+      }
+    })
     // Before super.init(): migrated headers carry local paths, so the stock
     // indexHeader pass below groups them without any alias involvement.
     // Backfill then only handles sessions synced in after this boot.
@@ -416,7 +458,14 @@ export class AliasWorkspaceRegistry extends WorkspaceRegistry {
 
 export { loadAliasConfig, aliasConfigPath, dshHomePath, pathKey } from './alias.ts'
 export { migrateSessionHeaders, projectKey, zstdFrameSize } from './migrate.ts'
-export { ALIAS_SETTINGS_NAMESPACE, AliasSettingsSchema, wireAliasSettingsBridge } from './settings.ts'
+export {
+  ALIAS_SETTINGS_NAMESPACE,
+  AliasSettingsConfig,
+  AliasSettingsSchema,
+  wireAliasConfigBridge,
+  wireAliasSettingsBridge,
+} from './settings.ts'
+export type { AliasSettingsRefs } from './settings.ts'
 export { AliasConfigStore } from './store.ts'
 export type { AliasConfig, AliasGroup, AliasSettingsShape } from './alias.ts'
 export type { MigrationReport, RewrittenEntry } from './migrate.ts'

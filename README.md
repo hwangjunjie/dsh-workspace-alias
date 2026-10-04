@@ -31,6 +31,15 @@ the old client service when it actually exists — a static `settingsScope`
 inject would abort the whole client boot on rc.2), so one build runs on both
 0.1.x and 0.2.0-rc.x.
 
+Settings page (v0.4.5): the `configForms` adapter projects the host snapshot into
+the shape the section renders, so `getSnapshot()` **must return a cached object**
+(the host store is identity-stable). Returning a fresh literal every call makes
+React schedule render after render until it throws
+`Maximum update depth exceeded`; the shell's slot boundary then drops the entry
+and the user gets an empty pane with the nav row still visible. The section is
+also wrapped in its own error boundary so any commit-phase error shows up as
+text rather than a blank page.
+
 Configure `<dshHome>/workspace-alias.json`:
 
 ```json
@@ -116,6 +125,7 @@ Session 格式 v4（DSH 0.2.0-rc.1 / rc.2）已验证兼容：存储头行结构
 
 | 插件版本 | 宿主 | 变更 |
 | --- | --- | --- |
+| 0.4.5 | 0.2.0-rc.2 | 修复设置页空白：`adaptConfigForm` 的 `getSnapshot()` 改为**身份缓存**——每次返回新对象会违反 `useSyncExternalStore` 的「快照必须缓存」契约，触发无限渲染（`Maximum update depth exceeded`），插槽边界随即放弃该 entry，表现为「导航行还在、面板空白」；同时给面板套上自己的错误边界，把 commit 期异常从「空白页」变成可见报错文字 |
 | 0.4.4 | 0.2.0-rc.2 | 适配宿主 settings API 换代：客户端**移除静态 `settingsScope` 注入**（rc.2 已无该服务，静态注入会让整个 client boot 失败：`RendererStartupFailure: Renderer boot failed for 1 plugin(s)`），改为运行时能力探测 `configForms` / `settingsScope` 双分支；主机侧新增 volatile config 桥（`static Config` + `configEditor`），旧 namespace 桥保留并加 `settings.configure({ auto: false })`（本插件自带页面，避免宿主重复渲染 schema 页） |
 | 0.4.3 | 0.2.0-rc.1 | 仓库迁移到 github.com/hwangjunjie；声明 0.2.0-rc.1 兼容；README 改为官方安装方式 |
 | 0.4.0 | 0.1.2-rc.1 | 设置界面（namespace 桥 + `settings.section` slot） |

@@ -33,6 +33,14 @@
  * The JSON file (workspace-alias.json) remains the single true source; the
  * host-side settings bridge (src/settings.ts) mirrors writes into it and
  * pushes external file changes back into the host-side settings surface.
+ *
+ * Snapshot rule (regression, v0.4.5): the `configForms` adapter is identity-
+ * cached. React's `useSyncExternalStore` compares `getSnapshot()` by Object.is
+ * on every render and schedules another render when it differs, so returning a
+ * fresh object per call spins until React throws "Maximum update depth
+ * exceeded"; the shell's slot boundary then abdicates the entry and the user
+ * sees a blank pane with the nav row still there. The section also carries its
+ * own error boundary, so a commit-phase throw renders text instead of nothing.
  */
 
 window.__ModuleLoader__.load({
@@ -135,18 +143,49 @@ window.__ModuleLoader__.load({
     // ---- the section component ---------------------------------------------
 
     /**
+     * Commit-phase guard. The shell surrounds each settings.section entry with a
+     * slot boundary that, on any error it did not get to report, drops the entry
+     * and leaves an empty pane behind — the nav row stays, the user sees a blank
+     * page and there is nothing to paste into a bug report. A render-phase throw
+     * is already caught inside `WorkspaceAliasSection`; this boundary covers the
+     * errors React raises while committing the tree it returned.
+     */
+    class SectionErrorBoundary extends react.Component {
+      constructor(props) {
+        super(props);
+        this.state = { error: null };
+      }
+
+      static getDerivedStateFromError(error) {
+        return { error: error };
+      }
+
+      render() {
+        var error = this.state.error;
+        if (error !== null) {
+          return el("div", { style: STYLES.root },
+            el("div", { style: STYLES.danger },
+              "设置面板渲染异常: " + (error && error.message ? error.message : String(error))));
+        }
+        return this.props.children;
+      }
+    }
+
+    /**
      * Rendered into the settings modal when our nav row is active. Slot props
      * carry `close`; we do not need it (the shell owns dismissal).
      */
     function makeSectionComponent(controller) {
       function WorkspaceAliasSection() {
+        var body;
         try {
-          return renderSectionBody(controller);
+          body = renderSectionBody(controller);
         } catch (error) {
           return el("div", { style: STYLES.root },
             el("div", { style: STYLES.danger },
               "设置面板渲染异常: " + (error && error.message ? error.message : String(error))));
         }
+        return el(SectionErrorBoundary, null, body);
       }
       return WorkspaceAliasSection;
     }
@@ -323,22 +362,45 @@ window.__ModuleLoader__.load({
      * host fences it with the revision it currently holds.
      */
     function adaptConfigForm(form) {
+      // `useSyncExternalStore` compares `getSnapshot()` with Object.is on every
+      // render and schedules another render whenever the result differs, so the
+      // projection MUST stay identity-stable until the underlying snapshot
+      // actually changes. Returning a fresh object literal on every call loops
+      // into "Maximum update depth exceeded"; the slot boundary then abdicates
+      // the entry and the user sees a blank pane with the nav row still there.
+      // The host store is identity-stable (createSnapshotStore), so cache on the
+      // snapshot's fields rather than on the wrapper object: a re-created but
+      // equal wrapper from the host must not restart the loop either.
+      var lastSnap = null;
+      var lastProjected = null;
+      function project(snap) {
+        var value = snap.value;
+        var usable =
+          snap.status === "ready" &&
+          value !== null &&
+          typeof value === "object" &&
+          !Array.isArray(value);
+        return {
+          status: usable ? "ready" : (snap.status === "loading" ? "loading" : "unavailable"),
+          value: usable ? value : undefined,
+          revision: snap.revision,
+          writable: snap.writable !== false,
+        };
+      }
       return {
         subscribe: function (listener) { return form.subscribe(listener); },
         getSnapshot: function () {
           var snap = form.getSnapshot() || {};
-          var value = snap.value;
-          var usable =
-            snap.status === "ready" &&
-            value !== null &&
-            typeof value === "object" &&
-            !Array.isArray(value);
-          return {
-            status: usable ? "ready" : (snap.status === "loading" ? "loading" : "unavailable"),
-            value: usable ? value : undefined,
-            revision: snap.revision,
-            writable: snap.writable !== false,
-          };
+          if (lastSnap !== null &&
+              lastSnap.status === snap.status &&
+              lastSnap.revision === snap.revision &&
+              lastSnap.writable === snap.writable &&
+              lastSnap.value === snap.value) {
+            return lastProjected;
+          }
+          lastSnap = snap;
+          lastProjected = project(snap);
+          return lastProjected;
         },
         mutate: function (ops, revision) { return form.mutate(ops, revision); },
       };

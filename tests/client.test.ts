@@ -8,7 +8,7 @@ import { join } from 'node:path'
  * `window.__ModuleLoader__` wrapper hands over, and drive `apply` against fake
  * cordis contexts for both settings generations.
  */
-function loadClient(): any {
+function loadClient(react: any = fakeReact()): any {
   const source = readFileSync(join(process.cwd(), 'client', 'client.js'), 'utf8')
   let spec: any
   const win = {
@@ -21,9 +21,87 @@ function loadClient(): any {
   new Function('window', source)(win)
   expect(spec.id).toBe('dsh-workspace-alias')
   return spec.factory((id: string) => {
-    if (id === 'react') return {}
+    if (id === 'react') return react
     throw new Error(`unexpected value import: ${id}`)
   })
+}
+
+/**
+ * Minimal React stub: just enough hooks to drive the section component so the
+ * tests can assert that the pane renders real content (and is never blank).
+ */
+function fakeReact() {
+  let states: any[] = []
+  let cursor = 0
+  return {
+    Fragment: Symbol('react.Fragment'),
+    createElement: (type: any, props: any, ...children: any[]) => ({
+      type,
+      // The client's `el()` packs children into the props object, so only an
+      // explicit child argument list may override them.
+      props: children.length > 0 ? { ...(props ?? {}), children } : { ...(props ?? {}) },
+    }),
+    Component: class {
+      props: any
+      state: any
+      constructor(props: any) {
+        this.props = props
+        this.state = {}
+      }
+    },
+    useSyncExternalStore: (_subscribe: unknown, getSnapshot: () => unknown) => getSnapshot(),
+    useState: (init: any) => {
+      const index = cursor++
+      if (!(index in states)) states[index] = typeof init === 'function' ? init() : init
+      return [
+        states[index],
+        (next: any) => {
+          states[index] = typeof next === 'function' ? next(states[index]) : next
+        },
+      ]
+    },
+    useEffect: () => {},
+    clear: () => {
+      states = []
+      cursor = 0
+    },
+  }
+}
+
+function collectTypes(node: any, out: any[] = []): any[] {
+  if (node === null || node === undefined || typeof node !== 'object') return out
+  if (Array.isArray(node)) {
+    for (const child of node) collectTypes(child, out)
+    return out
+  }
+  out.push(node.type)
+  collectTypes(node.props?.children, out)
+  return out
+}
+
+function collectText(node: any, out: string[] = []): string[] {
+  if (typeof node === 'string') {
+    out.push(node)
+    return out
+  }
+  if (node === null || node === undefined || typeof node !== 'object') return out
+  if (Array.isArray(node)) {
+    for (const child of node) collectText(child, out)
+    return out
+  }
+  collectText(node.props?.children, out)
+  return out
+}
+
+function collectProp(node: any, name: string, out: any[] = []): any[] {
+  if (node === null || node === undefined || typeof node !== 'object') return out
+  if (Array.isArray(node)) {
+    for (const child of node) collectProp(child, name, out)
+    return out
+  }
+  if (node.props !== undefined && name in node.props) out.push(node.props[name])
+  collectProp(node.props?.children, name, out)
+  return out
 }
 
 function fakeConfigForms(snapshot: any) {
@@ -196,6 +274,69 @@ describe('workspace-alias client half', () => {
     const ops = [{ op: 'set', path: ['autoAttach'], value: false }]
     void controller.mutate(ops)
     expect(forms.mutations).toEqual([{ ops, revision: undefined }])
+  })
+
+  it('keeps the projected snapshot identity stable for useSyncExternalStore', () => {
+    const mod = loadClient()
+    const value = { autoAttach: true, adoptAliased: false, groups: [['/a']] }
+    const forms = fakeConfigForms({ status: 'ready', value, revision: 3, writable: true })
+    const controller = mod.__test.adaptConfigForm(forms.form)
+
+    // Regression guard: a fresh object on every call makes React re-render
+    // forever ("Maximum update depth exceeded" → slot boundary abdicates the
+    // entry → blank pane while the nav row stays).
+    const first = controller.getSnapshot()
+    expect(controller.getSnapshot()).toBe(first)
+
+    // A re-created but equal host wrapper must not restart the loop either.
+    forms.setSnapshot({ status: 'ready', value, revision: 3, writable: true })
+    expect(controller.getSnapshot()).toBe(first)
+
+    // A real change still yields a new identity.
+    const nextValue = { ...value, groups: [['/b']] }
+    forms.setSnapshot({ status: 'ready', value: nextValue, revision: 4, writable: true })
+    const next = controller.getSnapshot()
+    expect(next).not.toBe(first)
+    expect(next).toEqual({ status: 'ready', value: nextValue, revision: 4, writable: true })
+  })
+
+  it('renders the editor, never a blank pane, for a ready snapshot', () => {
+    const react = fakeReact()
+    const mod = loadClient(react)
+    const forms = fakeConfigForms({
+      status: 'ready',
+      value: { autoAttach: true, adoptAliased: false, groups: [['/a', 'F:\\a']] },
+      revision: 2,
+      writable: true,
+    })
+    const host = fakeClientCtx({ configForms: forms.configForms })
+
+    mod.apply(host.ctx)
+    react.clear()
+    const element = host.registrations[0].component()
+
+    // The pane is wrapped in our own boundary: a commit-phase throw must show
+    // the error text instead of the shell's empty abdicated entry.
+    expect(element.type.getDerivedStateFromError).toBeTypeOf('function')
+    const types = collectTypes(element)
+    expect(types).toContain('input')
+    expect(types).toContain('button')
+    expect(collectText(element).join('')).toContain('别名组 1')
+    expect(collectProp(element, 'value')).toContain('/a')
+    expect(collectProp(element, 'value')).toContain('F:\\a')
+  })
+
+  it('renders the diagnostic branch, never a blank pane, while loading', () => {
+    const react = fakeReact()
+    const mod = loadClient(react)
+    const forms = fakeConfigForms({ status: 'loading', value: undefined, revision: 0, writable: false })
+    const host = fakeClientCtx({ configForms: forms.configForms })
+
+    mod.apply(host.ctx)
+    react.clear()
+    const text = collectText(host.registrations[0].component()).join('')
+    expect(text).toContain('正在读取别名配置')
+    expect(text).toContain('status=loading')
   })
 
   it('ships the same file in lib/ as in client/ (build sync)', () => {

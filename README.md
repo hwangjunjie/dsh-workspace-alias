@@ -8,11 +8,13 @@ project lives at different paths (`/Volumes/Data/notes` on macOS,
 `F:\notes` on Windows), this plugin makes synced sessions group into the
 local workspace of the same project instead of staying ungrouped.
 
-Install:
-
-```bash
-dsh plugin --profile web add https://github.com/lodfather/dsh-workspace-alias
-```
+Install (official desktop 0.2.0+): open **Settings → Plugins**, paste
+`https://github.com/hwangjunjie/dsh-workspace-alias` into the install field
+and confirm — the plugin manager runs the compatibility gate automatically
+(the legacy `dsh plugin add` CLI no longer ships with 0.2.0). Session format
+v4 (DSH 0.2.0-rc.1) is verified compatible: the stored-header line structure
+is unchanged (only `version: 3 → 4`) and generation files
+`session.vN.jsonl[.zstd]` are recognized for any N.
 
 Configure `<dshHome>/workspace-alias.json`:
 
@@ -35,10 +37,11 @@ Configure `<dshHome>/workspace-alias.json`:
 
 ## 安装
 
-```bash
-dsh plugin --profile web add https://github.com/lodfather/dsh-workspace-alias
-# 重启 dsh web
-```
+官方桌面版（0.2.0+）：**设置 → 插件**，在安装框粘贴仓库 URL
+`https://github.com/hwangjunjie/dsh-workspace-alias`，确认安装后重启。
+旧 CLI（`dsh plugin add`）在 0.2.0 已移除；安装时会自动过兼容门（peerDependencies 检查，本插件无需豁免）。
+
+Session 格式 v4（DSH 0.2.0-rc.1）已验证兼容：存储头行结构未变（仅 `version: 3 → 4`），世代命名 `session.vN.jsonl[.zstd]` 对任意 N 均可识别，无需针对 V3 做额外适配。
 
 插件自带的 `cordis.patch.yml` 会禁用官方 `workspace` 行并挂载本包（同服务名 `workspaceRegistry`），`workspace-controller` / `ui-workspace` / 侧边栏全部无感。
 
